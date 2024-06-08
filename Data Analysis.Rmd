@@ -1,0 +1,2285 @@
+# Step 1. select CpG site: from methylation_annotation.R
+```{bash}
+#### get full gene-cpg correlation
+cp /gpfs/data/gtex-group/mpavia/methylation/CpG_gene_correlation/results/*.cor.stats.txt /scratch/t.phs.yihaolu/GWAS_Meri
+cd /scratch/t.phs.yihaolu/GWAS_Meri/
+for file in *cor.stats.txt; do
+    filename=$(basename "$file")
+    echo '#!/bin/bash
+    #SBATCH --mem=5G  # Adjust memory as needed
+    #SBATCH --nodes=1
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --error=script/error_'${filename}'.err
+    #SBATCH --output=script/output_'${filename}'.out
+
+    cd /scratch/t.phs.yihaolu/GWAS_Meri
+    cut -d $'"'"'\t'"'"' -f1-3,5,9 '${file}' > simplified.'${filename}'
+    ' > submit_job_${filename}.sh
+
+    chmod +x submit_job_${filename}.sh
+    sbatch submit_job_${filename}.sh
+done
+
+rm slurm*
+
+```
+
+```{bash}
+# Only keep cpg and gene pairs with less than 50K distance.
+# Define the threshold variable
+THRESHOLD=100000
+
+
+# Loop through each file with the specified naming pattern
+for file in simplified.*.cor.stats.txt; do
+    filename=$(basename "$file")
+
+    # Generate job script for current file
+    echo '#!/bin/bash
+    #SBATCH --mem=5G  # Adjust memory as needed
+    #SBATCH --nodes=1
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --error=script/error_'${filename}'.err
+    #SBATCH --output=script/output_'${filename}'.out
+
+    cd /scratch/t.phs.yihaolu/GWAS_Meri
+    awk -F'"'"'\t'"'"' -v threshold='$THRESHOLD' '"'"'NR==1 || ($3>=-threshold && $3<=threshold)'"'"' '${file}' > filtered_'${filename}'
+    ' > submit_job_${filename}.sh
+
+    # Make the script executable
+    chmod +x submit_job_${filename}.sh
+
+    # Submit the generated script to the queue
+    sbatch submit_job_${filename}.sh
+done
+
+# Remove temporary job scripts
+rm slurm*
+
+# Concat all filtered files
+# Extract header from the first file
+head -n 1 $(ls filtered_simplified.*.cor.stats.txt | head -n 1) > concatenated_correlation.txt
+
+# Concatenate all files, skipping the header
+for file in filtered_simplified.*.cor.stats.txt; do
+    tail -n +2 "$file" >> concatenated_correlation.txt
+done
+
+```
+
+Select CpG site: based on F-stat
+```{r}
+library(data.table)
+library(tidyverse)
+library(pbapply)
+args <- commandArgs(trailingOnly = T)
+CHUNK = as.numeric(args[1])
+CHUNK_SIZE = 5E3
+
+# Prepare for F-test: merge expression data matrix and 
+expression_dir <- "/scratch/t.phs.yihaolu/map_eQTL/GTEx_Analysis_v8_eQTL_expression_matrices/"
+methylation_dir <- "/scratch/t.phs.yihaolu/map_mQTL/data/Phenotypes/bedfiles/"
+setwd("/scratch/t.phs.yihaolu/GWAS_Meri/")
+
+if(!file.exists("concatenated_correlation_simple.txt")) {
+  df <- fread("concatenated_correlation.txt") %>% select(cpg,gene) %>% distinct_all()
+  fwrite(df, file = "concatenated_correlation_simple.txt")
+} else {
+  df <- fread("concatenated_correlation_simple.txt")
+}
+
+
+if(CHUNK_SIZE * CHUNK > nrow(df)) {
+  stop("Exceed")
+}
+
+
+tissue <- c("Lung","Muscle_Skeletal","Whole_Blood")
+
+if(!file.exists("merge_exp.txt")) {
+  gene_expression <- lapply(tissue, function(x) fread(paste0(expression_dir,x,".v8.normalized_expression.bed.gz")) %>% mutate(tissue = x)) %>% 
+  rbindlist(fill = T) %>% relocate(tissue)
+  
+  fwrite(gene_expression, "merge_exp.txt")
+} else {
+  gene_expression <- fread("merge_exp.txt")
+}
+
+if(!file.exists("merge_dnam.txt")) {
+  methylation <- lapply(tissue, function(x) fread(paste0(methylation_dir,x,".bed.gz")) %>% mutate(tissue = x)) %>% 
+    rbindlist(fill = T) %>% relocate(tissue)
+
+  fwrite(methylation, "merge_dnam.txt")
+} else {
+  methylation <- fread("merge_dnam.txt")
+}
+
+
+
+exp_cov_dir <- "/scratch/t.phs.yihaolu/map_eQTL/GTEx_Analysis_v8_eQTL_covariates/"
+exp_cov_list <- dir(exp_cov_dir)
+exp_cov <- lapply(exp_cov_list, function(x) fread(paste0(exp_cov_dir,x))) %>% 
+  rbindlist(fill = T) %>% 
+  group_by(ID) %>% 
+  summarise_all(mean,na.rm=T) %>% 
+  column_to_rownames("ID") %>% 
+  data.frame() %>% 
+  t() %>% 
+  data.frame() %>% 
+  select("pcr","sex","platform",paste0("InferredCov",1:5)) %>% 
+  data.matrix() %>% 
+  apply(2, function(x) {
+    x[is.na(x)] <- mean(x,na.rm=T)
+    return(x)
+  })
+
+
+DNAm_cov_dir <- "/scratch/t.phs.yihaolu/map_mQTL/data/Covariates/"
+DNAm_cov_list <- dir(DNAm_cov_dir)
+DNAm_cov <- lapply(DNAm_cov_list, function(x) fread(paste0(DNAm_cov_dir,x))) %>% 
+  rbindlist(fill = T) %>% 
+  group_by(ID) %>% 
+  summarise_all(mean,na.rm=T) %>% 
+  column_to_rownames("ID") %>% 
+  data.frame() %>% 
+  t() %>% 
+  data.frame() %>% 
+  select(paste0("PEER",1:5)) %>% 
+  data.matrix() %>% 
+  apply(2, function(x) {
+    x[is.na(x)] <- mean(x,na.rm=T)
+    return(x)
+  })
+
+
+pval <- pblapply((CHUNK_SIZE * (CHUNK - 1) + 1) : min(nrow(df), CHUNK_SIZE * CHUNK), function(k) {
+  gene_name <- df$gene[k]
+  cpg_name <- df$cpg[k]
+  
+  Y <- gene_expression %>% 
+    filter(gene_id == gene_name) %>% 
+    column_to_rownames("tissue") %>% 
+    select(contains("GTEX")) %>% 
+    data.frame() %>% 
+    t()
+  
+  X <- methylation %>% 
+    filter(gene_id == cpg_name) %>% 
+    column_to_rownames("tissue") %>% 
+    select(contains("GTEX")) %>% 
+    data.frame() %>% 
+    t()
+  ids <- intersect(rownames(Y),names(which(rowSums(!is.na(X)) > 1)))
+  
+  Y <- Y[ids,,drop=F]
+  X <- X[ids,,drop=F]
+  
+  X <- apply(X,2,function(x) {
+    x[is.na(x)] <- mean(x,na.rm=T)
+    return(x)})
+  
+  exp_cov <- exp_cov[ids,]
+  DNAm_cov <- DNAm_cov[ids,]
+  
+  res <- sapply(colnames(Y), function(i) {
+    mod <- lm(Y[,i] ~ X + exp_cov + DNAm_cov)
+    mod_reduce <- lm(Y[,i] ~ exp_cov + DNAm_cov)
+    fstat <- anova(mod,mod_reduce)$`Pr(>F)`[2]
+    return(fstat)
+  }) %>% data.matrix() %>% t() %>% data.frame()
+  
+  res$gene <- gene_name
+  res$cpg <- cpg_name
+  
+  return(res)
+},cl=5)
+
+pval <- rbindlist(pval,fill=T)
+
+fwrite(pval, paste0(paste0("gene_cpg_cor/",CHUNK,".txt")))
+```
+submit
+```{bash}
+cd /scratch/t.phs.yihaolu/GWAS_Meri/script
+for CHUNK in {1..761}; do
+    echo '#!/bin/bash
+    #SBATCH --mem=10G  # Adjust memory as needed
+    #SBATCH --nodes=1
+    #SBATCH --ntasks-per-node=1
+    #SBATCH --cpus-per-task=1
+    #SBATCH --error=submit_job_'${CHUNK}'.sh.e%A
+    #SBATCH --output=submit_job_'${CHUNK}'.sh.o%A
+
+    cd /scratch/t.phs.yihaolu/GWAS_Meri
+    Rscript calculate_gene_cpg_cor.R '${CHUNK}'' > submit_job_${CHUNK}.sh
+    sbatch submit_job_${CHUNK}.sh
+done
+
+#!/bin/bash
+
+# Fetching job statuses for user 'yihaolu'
+qstat_output=$(qstat -u yihaolu)
+
+# Extract job names for completed jobs
+completed_jobs=$(echo "$qstat_output" | grep ' C ' | awk '{print $4}')
+
+for job_name in $completed_jobs; do
+    # Extract the job number from the job name
+    job_num=$(echo "$job_name" | sed 's/submit_job_//' | sed 's/.sh//')
+    
+    # Print the job number
+    echo "Checking job number: $job_num"
+    
+    # Check if the corresponding file doesn't exist in ../gene_cpg_cor/
+    if [[ ! -f ../gene_cpg_cor/${job_num}.txt ]]; then
+        # Resubmit the job
+        sbatch submit_job_${job_num}.sh
+        echo "Resubmitted job for $job_name"
+    fi
+done
+```
+load results
+```{r}
+library(data.table)
+library(tidyverse)
+library(pbapply)
+setwd("/scratch/t.phs.yihaolu/GWAS_Meri/gene_cpg_cor")
+source("/scratch/t.phs.yihaolu/map_mQTL/MVMR/functions.R")
+res <- list()
+for (i in 1:1e3) {
+  if(file.exists(paste0(i,".txt"))){
+    res[[i]] <- fread(paste0(i,".txt"))
+  }
+}
+
+gene_cpg <- rbindlist(res,fill=T)
+
+
+##############################################################################
+############### Restrict to CpGs used in external data #######################
+##############################################################################
+setwd("/scratch/t.phs.yihaolu/external_data/external_mQTLs")
+if(!file.exists("cpg_list.RData")){
+  cpg_list <- list()
+  for (study in c("FUSION","Mmeta","LBC")) {
+    print(study)
+    cpg_list[[study]] <- list()
+    for (chr in 1:22) {
+      print(chr)
+      txt_path <- paste0(study, "_chr", chr, ".txt")
+      tsv_path <- paste0(study, "_chr", chr, ".tsv")
+    
+      # Check which file exists and read it
+      print(paste0("Load study ", study))
+      if (file.exists(txt_path)) {
+        external_df <- fread(txt_path, select=c("gene"))
+      } else {
+        external_df <- fread(tsv_path, select=c("gene"))
+      }
+      cpg_list[[study]][[chr]] <- unique(external_df$gene)
+    }
+  }
+  cpg_list <- lapply(cpg_list,unlist)
+  save(cpg_list, file = "cpg_list.RData")
+} else {
+  load("cpg_list.RData")
+}
+
+
+# gene_cpg <- gene_cpg[gene_cpg$cpg %in% union(Reduce(intersect,cpg_list[1:2]),cpg_list[[3]]),]
+gene_cpg <- gene_cpg[gene_cpg$cpg %in% Reduce(intersect,cpg_list[c(1,3)]),]
+##############################################################################
+################################# Slice min ##################################
+##############################################################################
+metap <- gene_cpg %>% 
+  select(-c("gene","cpg")) %>% 
+  apply(1,function(x) sumlog(na.omit(x)))
+gene_cpg$metap <- metap
+
+
+gene_cpg <- gene_cpg %>% 
+  group_by(gene) %>% 
+  slice_min(metap, n = 1, na_rm = T) %>% 
+  select(gene, cpg, metap)
+
+
+gene_info <- fread("/home/yihaolu/XING/gene_info_GTEx_v8.txt") %>%
+  select(gene_id,gene_type)
+
+gene_cpg <- gene_cpg %>% 
+  inner_join(gene_info, by = c("gene"="gene_id")) %>% 
+  filter(gene_type == "protein_coding")
+
+fwrite(gene_cpg, file = "/scratch/t.phs.yihaolu/GWAS_Meri/slice_filtered_correlation.txt", sep = "\t")
+```
+
+
+# Step 2. map QTLs, from process_QTL_data.R
+## Step 2.0. not relavant to QTL mapping, but do it for future clumping: split vcf file into different chromosomes:
+```{bash}
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for chr in {1..22}; do
+echo '#!/bin/bash
+#SBATCH --mem=5G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=GTEx_'${chr}'.sh.e%A
+#SBATCH --output=GTEx_'${chr}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/
+plink --vcf /gpfs/data/pierce-lab/GTEx/GTEx_data/Genotypes/GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.SHAPEIT2_phased.MAF01.vcf.gz \
+--chr '${chr}' \
+--make-bed \
+--out /scratch/t.phs.yihaolu/GWAS_summary_statistics/GTEx_'${chr}'' > GTEx_${chr}.sh
+sbatch GTEx_${chr}.sh;
+done
+```
+## Step 2.1. map eQTL
+```{bash}
+cd /scratch/t.phs.yihaolu/map_eQTL/
+wget https://storage.googleapis.com/gtex_analysis_v8/single_tissue_qtl_data/GTEx_Analysis_v8_eQTL_covariates.tar.gz
+wget https://storage.googleapis.com/gtex_analysis_v8/single_tissue_qtl_data/GTEx_Analysis_v8_eQTL_expression_matrices.tar
+tar -xvzf GTEx_Analysis_v8_eQTL_covariates.tar.gz
+tar -xvf GTEx_Analysis_v8_eQTL_expression_matrices.tar
+cp GTEx_Analysis_v8_eQTL_expression_matrices/*.tbi ./
+rm GTEx_Analysis_v8_eQTL_expression_matrices/*.tbi
+mv *.tbi GTEx_Analysis_v8_eQTL_expression_matrices/
+
+# map eQTL
+cd /scratch/t.phs.yihaolu/map_eQTL/script
+geno_path=/gpfs/data/pierce-lab/GTEx/GTEx_data/Genotypes/GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.SHAPEIT2_phased.MAF01.vcf.gz
+outpath=/scratch/t.phs.yihaolu/map_eQTL/MVMR/output/full_eQTL
+
+
+for chr in {1..22}; do
+for tissue in Adipose_Subcutaneous Brain_Spinal_cord_cervical_c-1 Nerve_Tibial Adipose_Visceral_Omentum Brain_Substantia_nigra Ovary Adrenal_Gland Breast_Mammary_Tissue Pancreas Artery_Aorta Cells_Cultured_fibroblasts Pituitary Artery_Coronary Cells_EBV-transformed_lymphocytes Prostate Artery_Tibial Colon_Sigmoid Skin_Not_Sun_Exposed_Suprapubic Brain_Amygdala Colon_Transverse Skin_Sun_Exposed_Lower_leg Brain_Anterior_cingulate_cortex_BA24 Esophagus_Gastroesophageal_Junction Small_Intestine_Terminal_Ileum Brain_Caudate_basal_ganglia Esophagus_Mucosa Spleen Brain_Cerebellar_Hemisphere Esophagus_Muscularis Stomach Brain_Cerebellum Heart_Atrial_Appendage Testis Brain_Cortex Heart_Left_Ventricle Thyroid Brain_Frontal_Cortex_BA9 Kidney_Cortex Uterus Brain_Hippocampus Liver Vagina Brain_Hypothalamus Lung Whole_Blood Brain_Nucleus_accumbens_basal_ganglia Minor_Salivary_Gland Brain_Putamen_basal_ganglia Muscle_Skeletal; do echo '#!/bin/bash
+#SBATCH --mem=5G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=fastqtl_'${tissue}'_'${chr}'.sh.e%A
+#SBATCH --output=fastqtl_'${tissue}'_'${chr}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/LLR/cis_eQTL
+exp_path=/scratch/t.phs.yihaolu/map_eQTL/GTEx_Analysis_v8_eQTL_expression_matrices/'${tissue}'.v8.normalized_expression.bed.gz
+cov_path=/scratch/t.phs.yihaolu/map_eQTL/GTEx_Analysis_v8_eQTL_covariates/'${tissue}'.v8.covariates.txt
+
+QTLtools cis --vcf '$geno_path' \
+--bed $exp_path \
+--cov $cov_path \
+--nominal 1.0 \
+--region chr'${chr}':0-1000000000 \
+--window 1000000 \
+--std-err \
+--out '${outpath}'/'${tissue}'_'${chr}'.txt.gz' > fastqtl_${tissue}_${chr}.sh
+sbatch fastqtl_${tissue}_${chr}.sh
+done
+done
+```
+### Step 2.1.1. simplify and merge
+```{bash}
+cd /scratch/t.phs.yihaolu/map_eQTL/script
+for chr in {1..22}; do
+    echo '#!/bin/bash
+#SBATCH --job-name=rbind_'${chr}'
+#SBATCH --output=rbind_'${chr}'.out
+#SBATCH --error=rbind_'${chr}'.err
+#SBATCH --mem=4G
+#SBATCH --time=4:00:00
+
+cd /scratch/t.phs.yihaolu/map_eQTL/MVMR/output/full_eQTL
+
+for file in *_'${chr}'.txt.gz; do
+    base=$(basename "$file" .txt.gz)   # Remove the .txt.gz extension
+    tissue_name="${base%_*}"           # Remove the last underscore and everything after it
+    zcat $file | awk -v tissue="$tissue_name" '\''{print $0 " " tissue}'\'' >> merged_'${chr}'.txt
+done' > rbind_${chr}.sh
+    sbatch rbind_${chr}.sh
+done
+```
+
+
+```{r}
+# merge differnt tissues
+args <- commandArgs(TRUE)
+chr = as.numeric(args[1])
+library(tidyverse)
+library(data.table)
+setwd("/scratch/t.phs.yihaolu/map_eQTL/MVMR/output/full_eQTL")
+tissues = c("Adipose_Subcutaneous","Brain_Spinal_cord_cervical_c-1","Nerve_Tibial","Adipose_Visceral_Omentum","Brain_Substantia_nigra","Ovary","Adrenal_Gland","Breast_Mammary_Tissue","Pancreas","Artery_Aorta","Cells_Cultured_fibroblasts","Pituitary","Artery_Coronary","Cells_EBV-transformed_lymphocytes","Prostate","Artery_Tibial","Colon_Sigmoid","Skin_Not_Sun_Exposed_Suprapubic","Brain_Amygdala","Colon_Transverse","Skin_Sun_Exposed_Lower_leg","Brain_Anterior_cingulate_cortex_BA24","Esophagus_Gastroesophageal_Junction","Small_Intestine_Terminal_Ileum","Brain_Caudate_basal_ganglia","Esophagus_Mucosa","Spleen","Brain_Cerebellar_Hemisphere","Esophagus_Muscularis","Stomach","Brain_Cerebellum","Heart_Atrial_Appendage","Testis","Brain_Cortex","Heart_Left_Ventricle","Thyroid","Brain_Frontal_Cortex_BA9","Kidney_Cortex","Uterus","Brain_Hippocampus","Liver","Vagina","Brain_Hypothalamus","Lung","Whole_Blood","Brain_Nucleus_accumbens_basal_ganglia","Minor_Salivary_Gland","Brain_Putamen_basal_ganglia","Muscle_Skeletal")
+system.time({
+  df <- fread(paste0("merged_",chr,".txt"), select = c(1,8,12,14,15,17))
+})
+
+system.time({
+  df <- fread(paste0("merged_",chr,".txt"))
+})
+
+
+pval <- df %>%
+  pivot_wider(id_cols = c('V1','V8'),
+              names_from = c('V17'),
+              values_from = c('V12'))
+colnames(pval)[1:2] <- c("gene_id","variant_id")
+fwrite(pval, file = paste0("../merge_tissue/merged_pval_",chr,".txt"))
+rm(pval)
+
+beta <- df %>%
+  pivot_wider(id_cols = c('V1','V8'),
+              names_from = c('V17'),
+              values_from = c('V14'))
+colnames(beta)[1:2] <- c("gene_id","variant_id")
+fwrite(beta, file = paste0("../merge_tissue/merged_beta_",chr,".txt"))
+rm(beta)
+
+se <- df %>%
+  pivot_wider(id_cols = c('V1','V8'),
+              names_from = c('V17'),
+              values_from = c('V15'))
+colnames(se)[1:2] <- c("gene_id","variant_id")
+fwrite(se, file = paste0("../merge_tissue/merged_se_",chr,".txt"))
+rm(se)
+```
+
+```{bash}
+cd /scratch/t.phs.yihaolu/map_eQTL/script
+for chr in {1..22}; do
+memory=$(echo $((8 * (23 - chr) + 5)))
+echo "
+#PBS -l mem=${memory}gb
+cd /scratch/t.phs.yihaolu/map_eQTL/
+Rscript merge_data.R ${chr}" > merge_${chr}.sh
+qsub merge_${chr}.sh; done
+
+cd /scratch/t.phs.yihaolu/map_eQTL/script
+for chr in {1..22}; do echo "
+#PBS -l mem=5gb
+cd /scratch/t.phs.yihaolu/map_eQTL/MVMR/output/full_eQTL/merge_tissue/
+cut -d ',' -f 1-2 merged_beta_${chr}.txt > merged_info_${chr}.txt" > sub_${chr}.sh
+qsub sub_${chr}.sh; done
+
+```
+
+
+## Step 2.2. map mQTL
+```{bash}
+# map mQTL: note that slice_filtered_correlation.txt is obtained in methylation_annotation.R
+cp -r /gpfs/data/linchen-lab/Meri/data /scratch/t.phs.yihaolu/map_mQTL
+
+
+cd /scratch/t.phs.yihaolu/map_mQTL/data/Phenotypes/bedfiles
+rm filtered_*
+
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for tissue in Breast_Mammary_Tissue Kidney_Cortex Muscle_Skeletal Prostate Whole_Blood Colon_Transverse Lung Ovary Testis; do 
+echo '#!/bin/bash
+#SBATCH --mem=5G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=filter_'${tissue}'.sh.e%A
+#SBATCH --output=filter_'${tissue}'.sh.o%A
+module load bcftools/1.17
+cd /scratch/t.phs.yihaolu/map_mQTL/data/Phenotypes/bedfiles
+zcat '$tissue'.bed.gz | head -n 1 > filtered_'$tissue'.bed
+zcat '$tissue'.bed.gz | awk '"'"'NR==FNR {ids[$2]; next} $4 in ids'"'"' /scratch/t.phs.yihaolu/GWAS_Meri/slice_filtered_correlation.txt - >> filtered_'$tissue'.bed
+bgzip filtered_'$tissue'.bed
+tabix -p bed filtered_'$tissue'.bed.gz
+' > filter_${tissue}.sh
+sbatch filter_${tissue}.sh; 
+done
+
+
+
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+geno_path=/gpfs/data/pierce-lab/GTEx/GTEx_data/Genotypes/GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.SHAPEIT2_phased.MAF01.vcf.gz
+outpath=/scratch/t.phs.yihaolu/map_mQTL/MVMR/full_mQTL
+for chr in {1..22}; do
+for tissue in Breast_Mammary_Tissue Kidney_Cortex Muscle_Skeletal Prostate Whole_Blood Colon_Transverse Lung Ovary Testis; do 
+
+echo '#!/bin/bash
+#SBATCH --mem=5G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=fastqtl_'${tissue}'_'${chr}'.sh.e%A
+#SBATCH --output=fastqtl_'${tissue}'_'${chr}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/full_mQTL
+geno_path=/scratch/t.phs.yihaolu/GWAS_summary_statistics/GTEx_'${chr}'.vcf.gz
+
+exp_path=/scratch/t.phs.yihaolu/map_mQTL/data/Phenotypes/bedfiles/filtered_'${tissue}'.bed.gz
+tissue_without_underscore="'${tissue//_/}'"
+cov_path=/scratch/t.phs.yihaolu/map_mQTL/data/Covariates/$tissue_without_underscore.covariates.txt
+
+QTLtools cis --vcf '$geno_path' \
+--bed $exp_path \
+--cov $cov_path \
+--nominal 1.0 \
+--region chr'${chr}':0-1000000000 \
+--window 1500000 \
+--std-err \
+--out '${outpath}'/'${tissue}'_'${chr}'.txt.gz' > fastqtl_${tissue}_${chr}.sh
+sbatch fastqtl_${tissue}_${chr}.sh
+done
+done
+```
+### Step 2.2.1. simplify and merge
+```{r}
+# merge multi-tissue mQTL
+args <- commandArgs(trailingOnly = T)
+chr = as.numeric(args)
+library(data.table)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/map_mQTL/MVMR")
+tissue_list <- c("Ovary","Breast_Mammary_Tissue","Prostate","Testis","Kidney_Cortex","Lung","Whole_Blood","Colon_Transverse","Muscle_Skeletal")
+
+df <- list()
+for (i in 1:9) {
+  print(i)
+  df[[i]] <- fread(paste0("full_mQTL/",tissue_list[i],"_",chr,".txt.gz"), select = c(1,8,12,14,15))
+}
+
+pval <- lapply(df,function(x) x %>% select(V1:V8,V12)) %>% Reduce(function(x,y) full_join(x,y,by=c("V1","V8")), .)
+beta <- lapply(df,function(x) x %>% select(V1:V8,V14)) %>% Reduce(function(x,y) full_join(x,y,by=c("V1","V8")), .)
+se <- lapply(df,function(x) x %>% select(V1:V8,V15)) %>% Reduce(function(x,y) full_join(x,y,by=c("V1","V8")), .)
+colnames(pval) <- colnames(beta) <- colnames(se) <- c("cpg","SNP",tissue_list)
+fwrite(pval, file = paste0("merge_tissue/merge_pval_chr",chr,".txt"))
+fwrite(beta, file = paste0("merge_tissue/merge_beta_chr",chr,".txt"))
+fwrite(se, file = paste0("merge_tissue/merge_se_chr",chr,".txt"))
+```
+
+```{bash}
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/merge_tissue
+rm merge*
+
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for chr in {1..22}; do
+echo '#!/bin/bash
+#SBATCH --mem=100G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=5
+#SBATCH --error=merge_'${chr}'.sh.e%A
+#SBATCH --output=merge_'${chr}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/
+Rscript merge_mQTL.R '$chr'' > merge_${chr}.sh
+sbatch merge_${chr}.sh;
+done
+```
+
+# Step 3. merge eQTL and mQTL
+```{bash}
+# split lookup table
+cd /scratch/t.phs.yihaolu/map_eQTL/
+wget https://storage.googleapis.com/gtex_analysis_v8/reference/GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.lookup_table.txt.gz
+zcat GTEx_Analysis_2017-06-05_v8_WholeGenomeSeq_838Indiv_Analysis_Freeze.lookup_table.txt.gz|awk -F"\t" '{print > ("lookup/lookup_" $2".txt")}' -
+```
+
+```{r}
+# merge eQTL and mQTL, need snp, gene, cpg, ref allele, alt allele, eQTL eff/se/pval, mQTL eff/se/pval
+args <- commandArgs(trailingOnly = T)
+chr = as.numeric(args[1])
+stat = as.character(args[2])
+library(data.table)
+library(tidyverse)
+setwd("/scratch/t.phs.yihaolu/map_mQTL/MVMR")
+gene_info <- fread("/home/yihaolu/XING/gene_info_GTEx_v8.txt") %>% select(gene_id,Chr,gene_symbol,gene_type)
+lookup <- fread(paste0("../../map_eQTL/lookup/lookup_chr",chr,".txt"),h=F)
+colnames(lookup) <- c("variant_id","chr","variant_pos","ref","alt","num_alt_per_site","rsid","variant_id_b37")
+lookup <- lookup %>% select(variant_id,chr,ref,alt,rsid)
+print("Load eQTL ...")
+eQTL <- fread(paste0("../../map_eQTL/MVMR/output/merge_tissue/merged_",stat,"_",chr,".txt"))
+colnames(eQTL) <- paste0("eQTL_",colnames(eQTL))
+eQTL <- eQTL %>% inner_join(gene_info, c("eQTL_gene_id"="gene_id")) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  select(-gene_type) %>% select(-Chr)
+print("Load mQTL ...")
+mQTL <- fread(paste0("merge_tissue/merge_",stat,"_chr",chr,".txt"))
+
+eQTL[eQTL==0] <- NA
+mQTL[mQTL==0] <- NA
+
+colnames(mQTL) <- paste0("mQTL_",colnames(mQTL))
+print("Load dict ...")
+gene_cpg_df <- fread(paste0("/scratch/t.phs.yihaolu/GWAS_Meri/slice_filtered_correlation.txt"))
+print("Merge ...")
+df <- eQTL %>%
+  inner_join(gene_cpg_df, by = c("eQTL_gene_id" = "gene")) %>%
+  inner_join(mQTL, by = c("cpg" = "mQTL_cpg", "eQTL_variant_id" = "mQTL_SNP"))
+
+df <- df %>%
+  relocate(cpg, gene_symbol)
+# colnames(df)[1:5] <- c("Chr","cpg","gene_symbol","gene_id","variant_id")
+print("Merge with lookup ...")
+df <- df %>% inner_join(lookup, by = c("eQTL_variant_id" = "variant_id")) %>%
+  relocate(chr,ref,alt,rsid) %>% 
+  select(-gene_type)
+print("Save ...")
+fwrite(df, paste0("processed_mQTL/processed_eQTL_mQTL_",stat,"_chr",chr,".txt"))
+```
+
+
+```{bash}
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+rm processed_eQTL_mQTL_*.txt.gz
+
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for stat in beta se pval; do
+    for chr in {1..22}; do
+        if (( chr <= 12 )); then
+            mem="120G"
+        else
+            mem="60G"
+        fi
+
+        echo '#!/bin/bash
+#SBATCH --mem='$mem'
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=5
+#SBATCH --error=merge_'${chr}'_'${stat}'.sh.e%A
+#SBATCH --output=merge_'${chr}'_'${stat}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/
+Rscript merge_eQTL_mQTL.R '${chr}' '${stat}'
+
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+gzip processed_eQTL_mQTL_'${stat}'_chr'${chr}'.txt' > merge_${chr}_${stat}.slurm.sh
+    sbatch merge_${chr}_${stat}.slurm.sh
+    done
+done
+```
+
+
+
+# Step 4. merge with external QTL list
+process eQTLGen data
+```{bash}
+cd /scratch/t.phs.yihaolu/external_data/external_eQTLs
+wget https://molgenis26.gcc.rug.nl/downloads/eqtlgen/cis-eqtl/2019-12-11-cis-eQTLsFDR-ProbeLevel-CohortInfoRemoved-BonferroniAdded.txt.gz
+zcat 2019-12-11-cis-eQTLsFDR-ProbeLevel-CohortInfoRemoved-BonferroniAdded.txt.gz | \
+awk 'BEGIN {FS=OFS="\t"} 
+     NR==1 {
+         header=$3"\t"$2"\t"$1"\t"$5"\t"$6"\t"$7"\t"$9"\t"$13;
+         next
+     }
+     {
+         if (!printed[$3]++) {
+             print header > "eQTLGen_chr_"$3".txt"
+         };
+         print $3,$2,$1,$5,$6,$7,$9,$13 >> "eQTLGen_chr_"$3".txt"
+     }'
+     
+cd /scratch/t.phs.yihaolu/external_data/external_eQTLs
+wget https://molgenis26.gcc.rug.nl/downloads/eqtlgen/cis-eqtl/2018-07-18_SNP_AF_for_AlleleB_combined_allele_counts_and_MAF_pos_added.txt.gz
+zcat 2018-07-18_SNP_AF_for_AlleleB_combined_allele_counts_and_MAF_pos_added.txt.gz | \
+awk 'BEGIN {FS=OFS="\t"} 
+     NR==1 {
+         header=$1"\t"$2"\t"$4"\t"$5"\t"$9;
+         next
+     }
+     {
+         if (!printed[$2]++) {
+             print header > "SNP_info_chr"$2".txt"
+         };
+         print $1,$2,$4,$5,$9 >> "SNP_info_chr"$2".txt"
+     }'
+```
+
+```{r}
+library(data.table)
+library(tidyverse)
+gene_info <- fread("/home/yihaolu/XING/gene_info_GTEx_v8.txt") %>% 
+  filter(gene_type == "protein_coding") %>% select(gene_id,gene_symbol) %>% distinct_all()
+for (chr in 1:22) {
+  print(chr)
+  setwd("/scratch/t.phs.yihaolu/external_data/external_eQTLs")
+  
+  eQTLGen <- fread(paste0("eQTLGen_chr_",chr,".txt"))
+  eQTLGen <- eQTLGen %>% inner_join(gene_info,by=c("GeneSymbol"="gene_symbol"))
+
+  
+  SNP_info <- fread(paste0("/scratch/t.phs.yihaolu/external_data/external_eQTLs/SNP_info_chr",chr,".txt"))
+  
+  eQTLGen <- rbind(eQTLGen %>% 
+    inner_join(SNP_info, by = c("SNP" = "SNP","AssessedAllele" = "AlleleA", "OtherAllele" = "AlleleB")),
+    eQTLGen %>% 
+    inner_join(SNP_info, by = c("SNP" = "SNP","AssessedAllele" = "AlleleB", "OtherAllele" = "AlleleA"))
+  )
+  
+  eQTLGen <- eQTLGen %>% 
+    mutate(beta = Zscore / sqrt(AlleleB_all * (1 - AlleleB_all) * (NrSamples + Zscore^2))) %>% 
+    mutate(se = 1 / sqrt(AlleleB_all * (1 - AlleleB_all) * (NrSamples + Zscore^2)))
+  
+  eQTLGen <- eQTLGen %>% 
+      rename(gene = gene_id, ref = OtherAllele, alt = AssessedAllele, pval = Pvalue, rsid = SNP) %>% 
+      select(gene, ref, alt, pval, rsid, beta, se)
+  
+  
+  fwrite(eQTLGen, paste0("eQTLGen_chr",chr,".txt"))
+}
+```
+
+process LBC data
+```{bash}
+cd /scratch/t.phs.yihaolu/external_data/external_mQTLs/
+wget https://cnsgenomics.com/data/SMR/LBC_BSGS_meta.tar.gz
+tar -xvf LBC_BSGS_meta.tar.gz
+cd LBC_BSGS_meta
+
+for chr in {1..22}; do
+../smr-1.3.1-linux-x86_64/smr-1.3.1 --beqtl-summary bl_mqtl_chr$chr --query 1 --out LBC_chr$chr; done
+
+for chr in {1..22}; do
+cut -d$'\t' -f1,2,4,5,7,12,13,14 LBC_chr$chr.txt > LBC_chr$chr.simple.txt; done
+
+for chr in {13..22}; do
+awk 'BEGIN {OFS="\t"} NR==1 {$1="rsid"; $2="chr"; $3="ref"; $4="alt"; $5="gene"; $6="beta"; $7="se"; $8="pval"} 1' LBC_chr$chr.simple.txt > LBC_chr$chr.txt; done
+
+rm LBC_chr*simple.txt
+
+mv LBC_chr* ../
+```
+
+process FUSION
+```{bash}
+cp /gpfs/data/gtex-group/mpavia/methylation/HyPrColoc/data/external_mQTLs/FUSION.all.tsv.gz* /scratch/t.phs.yihaolu/external_data/external_mQTLs
+
+module load htslib/1.17
+cd /scratch/t.phs.yihaolu/external_data/external_mQTLs
+tabix -l FUSION.all.tsv.gz > unique_chromosomes.txt
+
+
+while read chrom; do 
+echo '#!/bin/bash
+#SBATCH --mem=5G
+#SBATCH --nodes=1
+module load htslib/1.17
+cd /scratch/t.phs.yihaolu/external_data/external_mQTLs
+tabix FUSION.all.tsv.gz '"$chrom"' > raw_FUSION_chr'"$chrom"'.tsv
+echo -e "gene\tref\talt\tpval\tbeta\tse\trsid" > FUSION_chr'"$chrom"'.tsv
+cut -f 1,4,5,9,10,11,19 raw_FUSION_chr'"$chrom"'.tsv >> FUSION_chr'"$chrom"'.tsv
+rm raw_FUSION_chr'"$chrom"'.tsv
+' > process_FUSION_$chrom.sh; 
+sbatch process_FUSION_$chrom.sh;
+done < unique_chromosomes.txt
+```
+
+
+```{r}
+#################################################################
+#################### Merge external QTL data ####################
+#################################################################
+args <- commandArgs(trailingOnly = T)
+chr = as.numeric(args[1])
+stat = as.character(args[2])
+# chr <- 21; stat <- "se"
+library(tidyverse)
+library(data.table)
+
+setwd("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/")
+external_path <- "/scratch/t.phs.yihaolu/external_data/"
+print("Load processed_eQTL_mQTL_...")
+QTL <- fread(paste0("processed_eQTL_mQTL_",stat,"_chr",chr,".txt.gz"))
+print("Split processed_eQTL_mQTL_...")
+gene_info <- fread("/home/yihaolu/XING/gene_info_GTEx_v8.txt") %>% 
+  filter(gene_type == "protein_coding") %>% select(gene_id)
+gene_info$eQTL_gene_id <- str_split(gene_info$gene_id,"[.]") %>% sapply(function(x) x[1])
+genes <- gene_info$eQTL_gene_id
+names(genes) <- gene_info$gene_id
+QTL$eQTL_gene_id <- genes[QTL$eQTL_gene_id]
+print("Filter processed_eQTL_mQTL_...")
+QTL <- QTL %>% filter(rsid != ".")
+# merge external eQTL:
+QTL_list <- fread(paste0(external_path,"tabix_ftp_paths.tsv"))
+QTL_list <- QTL_list %>%
+  filter(str_detect(ftp_path, ".all.tsv.gz") & quant_method == "ge") %>%
+  filter(study_label != "GTEx") %>%
+  filter(str_detect(tissue_label, "brain|blood")) %>% 
+  filter(sample_size > 200, study_label == "ROSMAP")
+
+for (study in c("eQTLGen",paste0(QTL_list$dataset_id,".all"))) { # ,"PsychENCODE"
+  print(paste0("Load study ", study))
+  txt_path <- paste0(external_path, "external_eQTLs/", study, "_chr", chr, ".txt")
+  tsv_path <- paste0(external_path, "external_eQTLs/", study, "_chr", chr, ".tsv")
+
+  # Check which file exists and read it
+  if (file.exists(txt_path)) {
+    external_df <- fread(txt_path)
+  } else {
+    external_df <- fread(tsv_path)
+  }
+
+  external_df <- external_df %>% filter(rsid != ".")
+
+  external_df$gene <- str_split(external_df$gene,"[.]") %>% sapply(function(x) x[1])
+
+
+  external_df <- external_df %>%
+    select(gene, rsid, ref, alt, !!stat) %>%
+    rename(!!study := !!stat) %>%
+    filter(gene %in% QTL$eQTL_gene_id)
+
+  QTL <- QTL %>%
+    left_join(external_df, by = c("eQTL_gene_id" = "gene", "rsid"), suffix = c('','.x'))
+  
+  if(stat == "beta") {
+    switch_index <- which(QTL$ref == QTL$alt.x & QTL$alt == QTL$ref.x)
+    nonmatch_index <- setdiff(which(QTL$ref != QTL$ref.x | QTL$alt != QTL$alt.x),switch_index)
+
+    QTL[[study]][switch_index] <- -QTL[[study]][switch_index]
+    QTL[[study]][nonmatch_index] <- NA
+  }
+
+  QTL <- QTL %>% select(-ref.x, -alt.x)
+}
+
+# merge external mQTL:
+for (study in c("FUSION","LBC","Mmeta")) {
+  txt_path <- paste0(external_path, "external_mQTLs/", study, "_chr", chr, ".txt")
+  tsv_path <- paste0(external_path, "external_mQTLs/", study, "_chr", chr, ".tsv")
+
+  # Check which file exists and read it
+  print(paste0("Load study ", study))
+  if (file.exists(txt_path)) {
+    external_df <- fread(txt_path)
+  } else {
+    external_df <- fread(tsv_path)
+  }
+  
+  external_df <- external_df %>%
+    select(gene, rsid, ref, alt, !!stat) %>%
+    rename(!!study := !!stat) %>%
+    filter(gene %in% QTL$cpg)
+  QTL <- QTL %>%
+    left_join(external_df, by = c("cpg" = "gene", "rsid"), suffix = c('','.x'))
+  
+  if(stat == "beta") {
+    switch_index <- which(QTL$ref == QTL$alt.x & QTL$alt == QTL$ref.x)
+    nonmatch_index <- setdiff(which(QTL$ref != QTL$ref.x | QTL$alt != QTL$alt.x),switch_index)
+  
+    QTL[[study]][switch_index] <- -QTL[[study]][switch_index]
+    QTL[[study]][nonmatch_index] <- NA
+  }
+  
+  QTL <- QTL %>% select(-ref.x, -alt.x)
+}
+fwrite(QTL, file = paste0("external_processed_eQTL_mQTL_",stat,"_chr",chr,".txt"))
+```
+
+```{bash}
+#####################################################
+#################### Submit jobs ####################
+#####################################################
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+rm external_processed_eQTL_mQTL_*.gz
+
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for chr in {1..22}; do
+for stat in beta se pval; do
+echo '#!/bin/bash
+#SBATCH --mem=120G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=5
+#SBATCH --error=merge_external_'${chr}'_'${stat}'.sh.e%A
+#SBATCH --output=merge_external_'${chr}'_'${stat}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/
+Rscript merge_external.R '$chr' '$stat'
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+gzip external_processed_eQTL_mQTL_'${stat}'_chr'${chr}'.txt' > merge_external_${chr}_${stat}.sh
+sbatch merge_external_${chr}_${stat}.sh;
+done
+done
+```
+
+
+
+# Step 5. merge with GWAS
+```{r}
+#############################################################################
+#################### Merge external GWAS data themselves ####################
+#############################################################################
+library(tidyverse)
+library(data.table)
+
+setwd("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/")
+external_path <- "/scratch/t.phs.yihaolu/external_data/"
+GWAS_path <- "/scratch/t.phs.yihaolu/GWAS_Meri/"
+disease_list <- fread(paste0(GWAS_path,"v3_disease.csv"))
+
+GWAS <- list()
+for (study in disease_list$Filename) {
+  print(study)
+  GWAS[[study]] <- fread(paste0(GWAS_path, study))
+}
+GWAS <- lapply(GWAS, function(x) x %>% distinct_at(vars(variant_id), .keep_all = T))
+stat = c("effect_size","standard_error","pvalue")
+
+for (k in 3:3) {
+  print(k)
+  df <- GWAS[[1]] %>%
+    select(variant_id, effect_allele, non_effect_allele, !!stat[k])
+
+  for (i in 2:length(GWAS)) {
+    print(i)
+    df <- df %>% full_join(GWAS[[i]] %>%
+                             select(variant_id, effect_allele, non_effect_allele, !!stat[k]),
+                           by = "variant_id", suffix = c("",".x"))
+
+
+    df <- df %>%
+      mutate(effect_allele = ifelse(is.na(effect_allele), effect_allele.x, effect_allele)) %>%
+      mutate(non_effect_allele = ifelse(is.na(non_effect_allele), non_effect_allele.x, non_effect_allele))
+
+    if(stat[k] == "effect_size") {
+      switch_index <- which(df$effect_allele == df$non_effect_allele.x & df$non_effect_allele == df$effect_allele.x)
+      non_match_index <- which((df$effect_allele != df$effect_allele.x & 
+                                  df$effect_allele != df$non_effect_allele.x)|
+                                 (df$non_effect_allele != df$non_effect_allele.x &
+                                    df$non_effect_allele != df$effect_allele.x))
+      print(length(non_match_index))
+
+      if(length(switch_index) > 0) {
+        df[[ncol(df)]][switch_index] = -1 * df[[ncol(df)]][switch_index]
+      }
+
+      if(length(non_match_index) > 0) {
+        df[[ncol(df)]][non_match_index] <- NA
+      }
+    }
+    df <- df %>% select(-effect_allele.x,-non_effect_allele.x)
+  }
+  colnames(df) <- c("variant_id", "effect_allele", "non_effect_allele",names(GWAS))
+  fwrite(df, file = paste0("v3_full_merged_GWAS_",stat[k],".txt"))
+}
+
+```
+
+```{r}
+############################################################################
+#################### Merge eQTL with external GWAS data ####################
+############################################################################
+library(tidyverse)
+library(data.table)
+# chr <- 21; stat <- "pval"
+args <- commandArgs(trailingOnly = T)
+chr = as.numeric(args[1])
+stat = as.character(args[2])
+setwd("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/")
+external_path <- "/scratch/t.phs.yihaolu/external_data/"
+GWAS_path <- "/scratch/t.phs.yihaolu/GWAS_Meri/"
+stat_dict <- c("beta" = "effect_size", "se" = "standard_error", "pval" = "pvalue")
+
+for (stat in names(stat_dict)[3]) {
+  print(stat)
+  GWAS <- fread(paste0("v3_full_merged_GWAS_",stat_dict[stat],".txt"))
+
+  GWAS <- GWAS %>%
+    rename(ref = non_effect_allele,
+           alt = effect_allele)
+
+  for (chr in 21) { # 1:22
+    print(chr)
+    QTL <- fread(paste0("external_processed_eQTL_mQTL_",stat,"_chr",chr,".txt.gz")) %>% filter(rsid != ".")
+    print("Join ...")
+    QTL <- QTL %>%
+      left_join(GWAS, by = c("rsid"="variant_id"), suffix = c('','.x'))
+
+    fwrite(QTL, file = paste0("v3_external_GWAS_processed_eQTL_mQTL_",stat,"_chr",chr,".txt"))
+    
+    rm(QTL)
+}
+}
+
+# suggest open three windows and do it in the loop
+# it uses too much mem, will be killed
+# if only one cpg, you can use slurm to submit jobs
+```
+
+```{bash}
+#####################################################
+#################### Submit jobs ####################
+#####################################################
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+rm external_GWAS_processed_eQTL_mQTL_*.txt.gz
+
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for chr in {1..22}; do
+for stat in beta se pval; do
+echo '#!/bin/bash
+#SBATCH --mem=50G
+#SBATCH --nodes=5
+#SBATCH --ntasks-per-node=5
+#SBATCH --error=merge_external_GWAS_'${chr}'_'${stat}'.sh.e%A
+#SBATCH --output=merge_external_GWAS_'${chr}'_'${stat}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/
+Rscript merge_external_GWAS.R '$chr' '$stat'
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+pigz external_GWAS_processed_eQTL_mQTL_'${stat}'_chr'${chr}'.txt' > merge_external_GWAS_${chr}_${stat}.sh
+sbatch merge_external_GWAS_${chr}_${stat}.sh;
+done
+done
+
+#####################################################
+#################### Compress files ####################
+#####################################################
+cd /scratch/t.phs.yihaolu/map_mQTL/script
+for chr in {1..22}; do
+for stat in beta se pval; do
+echo '#!/bin/bash
+#SBATCH --mem=10G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --error=merge_external_GWAS_'${chr}'_'${stat}'.sh.e%A
+#SBATCH --output=merge_external_GWAS_'${chr}'_'${stat}'.sh.o%A
+
+cd /scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/
+pigz v3_external_GWAS_processed_eQTL_mQTL_'${stat}'_chr'${chr}'.txt' > merge_external_GWAS_${chr}_${stat}.sh
+sbatch merge_external_GWAS_${chr}_${stat}.sh;
+done
+done
+```
+
+
+
+
+
+# Step 6.1. More generally, do LD clumping and prepare data for MR
+```{r}
+# script 1: simplify for clump
+library(data.table)
+library(tidyverse)
+library(pbapply)
+
+args <- commandArgs(TRUE)
+chr = as.numeric(args[1])
+filename = as.character(args[2])
+r2 = as.numeric(args[3])
+num_cross = as.numeric(args[4])
+min_num = as.numeric(args[5])
+kb = as.numeric(args[6])
+# chr <- 1
+# filename <- "imp_imputed_IGAP_Alzheimer.txt.gz"
+# r2 <- 0.99
+# num_cross <- 2
+# min_num <- 10
+# kb <- 300
+
+
+setwd("/scratch/t.phs.yihaolu/MVMR_ML")
+source("experiment_data_generation_test_vec.R")
+source("experiment_data_generation.R")
+source("/scratch/t.phs.yihaolu/map_mQTL/MVMR/functions.R")
+
+# IV selection threshold
+threshold = 5e-3
+
+external_path <- "/scratch/t.phs.yihaolu/external_data/"
+QTL_list <- fread(paste0(external_path,"tabix_ftp_paths.tsv"))
+QTL_list <- QTL_list %>%
+  filter(str_detect(ftp_path, ".all.tsv.gz") & quant_method == "ge") %>%
+  filter(study_label != "GTEx") %>%
+  filter(str_detect(tissue_label, "brain")) %>%
+  filter(sample_size > 200, study_label == "ROSMAP")
+external_context <- c(paste0(QTL_list$dataset_id,".all"))
+
+setwd("/scratch/t.phs.yihaolu/GWAS_Meri")
+dict <- read_csv("disease.csv")
+
+dict <- dict[dict$Filename == filename,]
+relevant_tissues <- list()
+relevant_tissues$expression_tissues <- c("Muscle_Skeletal","Lung","Brain_Cerebellum")
+relevant_tissues$methylation_tissues <- "Lung"
+external_context <- c(external_context, "eQTLGen", "FUSION", "LBC")
+
+context_included <- c(paste0("eQTL_",relevant_tissues$expression_tissues),
+                      paste0("mQTL_",relevant_tissues$methylation_tissues),
+                      external_context)
+QTL <- fread(paste0("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/v3_external_GWAS_processed_eQTL_mQTL_pval_chr",chr,".txt.gz"),
+             select = c("rsid","cpg","gene_symbol","eQTL_variant_id",
+                        context_included,
+                        filename)) %>% 
+  mutate(index = 1:n()) %>% 
+  filter(rsid!='.')
+
+
+QTL_se <- fread(paste0("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/v3_external_GWAS_processed_eQTL_mQTL_se_chr",chr,".txt.gz"),
+             select = c("rsid","cpg","gene_symbol","eQTL_variant_id",
+                        context_included,
+                        filename)) %>% 
+  mutate(index = 1:n()) %>% 
+  filter(rsid!='.')
+QTL_beta <- fread(paste0("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/v3_external_GWAS_processed_eQTL_mQTL_beta_chr",chr,".txt.gz"),
+             select = c("rsid","cpg","gene_symbol","eQTL_variant_id",
+                        context_included,
+                        filename)) %>% 
+  mutate(index = 1:n()) %>% 
+  filter(rsid!='.')
+QTL[is.na(QTL_se)] <- NA
+QTL[is.na(QTL_beta)] <- NA
+##################################################################
+#################### Multivariable Clump #########################
+##################################################################
+QTL_no_NA <- QTL %>%
+  drop_na()
+# # select cross-tissue IVs
+# QTL_no_NA$cross_expression_tissue <- rowSums(QTL_no_NA %>%
+#                               select(context_included[!str_detect(context_included,"mQTL_")])<5e-3)
+# QTL_no_NA$cross_DNAm_tissue <- rowSums(QTL_no_NA %>%
+#                               select(contains("mQTL_"))<5e-3)
+# QTL_no_NA$cross_tissue <- QTL_no_NA$cross_expression_tissue + QTL_no_NA$cross_DNAm_tissue
+
+b <- QTL_beta[QTL_no_NA$index,] %>% 
+  select(eQTL_Muscle_Skeletal:LBC)
+
+p <- QTL_no_NA %>% 
+  select(eQTL_Muscle_Skeletal:LBC)
+
+b[p>threshold] <- NA
+effPos <- rowSums(b > 0,na.rm=T)
+effNeg <- rowSums(b < 0,na.rm=T)
+effSig <- ifelse(effPos > effNeg, effPos, effNeg)
+QTL_no_NA$cross_tissue <- effSig
+
+QTL_no_NA <- QTL_no_NA %>%
+  filter(cross_tissue >= num_cross)
+
+max_cross <- max(QTL_no_NA$cross_tissue)
+
+QTL_no_NA$rowmeta <- QTL_no_NA %>%
+  select(context_included) %>%
+  apply(1,function(x) {sumlog(x)}) %>%
+  as.numeric()
+
+QTL_no_NA$rowmin <- QTL_no_NA %>%
+  select(context_included) %>%
+  apply(1,function(x) {min(x)}) %>%
+  as.numeric()
+
+QTL_no_NA$rowmeta_transf <- transf(QTL_no_NA$rowmeta, QTL_no_NA$cross_tissue, max_cross)
+
+bfile_path <- paste0("/scratch/t.phs.yihaolu/GWAS_summary_statistics/GTEx_",chr)
+QTL_no_NA <- QTL_no_NA %>%
+  split(.$gene_symbol)
+
+
+clumped <- list()
+for (context in context_included) {
+  print(context)
+  clumped[[context]] <- pblapply(QTL_no_NA,
+                      clump,clump_kb=kb,clump_r2=r2,
+                      pval_col = context,
+                      bfile=bfile_path,
+                      cl=5)
+}
+clumped <- lapply(clumped,rbindlist) %>% 
+  rbindlist() %>% distinct_all() %>% 
+  select(eQTL_variant_id, index, rowmin)
+
+# clumped <- pblapply(QTL_no_NA,
+#                       clump,clump_kb=kb,clump_r2=r2,
+#                       pval_col = "rowmeta_transf",
+#                       bfile=bfile_path,
+#                       cl=30)
+# clumped <- do.call("rbind",clumped) %>% 
+#   select(eQTL_variant_id, index, rowmin)
+
+
+# script 3: perform merge
+rm(QTL)
+setwd("/scratch/t.phs.yihaolu/GWAS_Meri")
+setwd("/scratch/t.phs.yihaolu/map_mQTL/MVMR/processed_mQTL/")
+
+QTL_pval <- fread(paste0("v3_external_GWAS_processed_eQTL_mQTL_pval_chr",
+                         chr,".txt.gz"),
+             select = c("rsid","cpg","gene_symbol","eQTL_variant_id",
+                        context_included,
+                        filename)) %>% 
+  mutate(index = 1:n()) %>% 
+  filter(rsid!='.')
+
+QTL_beta <- QTL_beta %>% inner_join(clumped, by = c("eQTL_variant_id","index"))
+QTL_se <- QTL_se %>% inner_join(clumped, by = c("eQTL_variant_id","index"))
+QTL_pval <- QTL_pval %>% 
+  inner_join(clumped, by = c("eQTL_variant_id","index"))
+
+same_allele <- which(QTL_beta$effect_allele == QTL_beta$alt & QTL_beta$non_effect_allele == QTL_beta$ref)
+flip_allele <- which(QTL_beta$effect_allele == QTL_beta$ref & QTL_beta$non_effect_allele == QTL_beta$alt)
+
+QTL_beta <- QTL_beta %>% as.data.frame()
+colnames(QTL_beta)[colnames(QTL_beta) == "eQTL_gene_id"] <- "gene_id"
+
+if(length(flip_allele) > 0) {
+  QTL_beta[flip_allele,which(str_detect(colnames(QTL_beta),"QTL"))] <- (-1) * QTL_beta[flip_allele,which(str_detect(colnames(QTL_beta),"QTL"))]
+}
+QTL_beta <- data.table(QTL_beta)
+df <- list(eff = QTL_beta, se = QTL_se, pval = QTL_pval)
+##################################################################
+############################ Perform MR ##########################
+##################################################################
+df <- lapply(df,function(x) x %>% distinct_at(vars(rsid,gene_symbol),.keep_all=T))
+info <- df[[1]] %>%
+  select(gene_symbol,rsid,rowmin) %>%
+  mutate(index = 1:n()) %>%
+  filter(rowmin < threshold) %>%
+  group_by(gene_symbol) %>%
+  mutate(n = n()) %>%
+  filter(n >= min_num) %>%
+  ungroup()
+
+df <- lapply(df, function(x) {
+  colnames(x)[colnames(x) == "eQTL_gene_id"] <- "gene_id"
+  return(x)
+})
+
+# require each tissue have >= 1 IV
+pval_list <- df[[3]] %>% select(context_included)
+info <- cbind(info, pval_list[info$index,]) %>%
+  as.data.frame() %>%
+  pivot_longer(cols = colnames(pval_list), values_to = 'p', 
+               names_to = 'tissue') %>%
+  group_by(gene_symbol,tissue) %>%
+  slice_min(p, n = 1, with_ties = F) %>%
+  ungroup() %>%
+  group_by(gene_symbol) %>%
+  slice_max(p, n = 1, with_ties = F) %>%
+  filter(p < threshold)
+
+beta_list <- df[[1]] %>% filter(gene_symbol %in% info$gene_symbol) %>% filter(rowmin < threshold)
+se_list <- df[[2]] %>% filter(gene_symbol %in% info$gene_symbol) %>% filter(rowmin < threshold)
+pval_list <- df[[3]] %>% filter(gene_symbol %in% info$gene_symbol) %>% filter(rowmin < threshold)
+
+pval_list %>% 
+  select(context_included) %>% 
+  apply(1,which.min) %>% 
+  table()
+
+gammah <- beta_list %>% select(eQTL_variant_id, gene_symbol, cpg, context_included)
+Gammah <- beta_list %>% select(eQTL_variant_id, gene_symbol, cpg, all_of(filename)) %>% rename(effect_size = all_of(filename))
+
+se1 <- se_list %>% select(eQTL_variant_id, gene_symbol, cpg, context_included)
+se2 <- se_list %>% select(eQTL_variant_id, gene_symbol, cpg, all_of(filename)) %>% 
+  rename(standard_error = all_of(filename)) %>% 
+  mutate(standard_error = as.numeric(standard_error))
+
+pval <- pval_list %>% select(eQTL_variant_id, gene_symbol, cpg, context_included)
+
+rsid = Gammah %>% ungroup() %>% split(list(Gammah$gene_symbol)) %>% lapply(function(x) x$eQTL_variant_id)
+geneid = Gammah %>% ungroup() %>% split(list(Gammah$gene_symbol)) %>% lapply(function(x) x$gene_symbol)
+geneid <- names(geneid)
+Gammah <- Gammah %>% ungroup() %>% split(list(Gammah$gene_symbol)) %>% lapply(function(x) data.matrix(x$effect_size))
+gammah <- gammah %>% ungroup()  %>% split(list(gammah$gene_symbol)) %>% lapply(function(x) x %>% select(context_included) %>% data.matrix())
+pval <- pval %>% ungroup()  %>% split(list(pval$gene_symbol)) %>% lapply(function(x) x %>% select(context_included) %>% data.matrix())
+
+se1 <- se1 %>% ungroup()  %>% split(list(se1$gene_symbol)) %>% 
+  lapply(function(x) x %>% 
+           select(context_included) %>% 
+           data.matrix())
+se2 <- se2 %>% ungroup() %>% split(list(se2$gene_symbol)) %>% 
+  lapply(function(x) data.matrix(x$standard_error))
+
+
+LD_path <- "/scratch/t.phs.yihaolu/MVMR_ML/result/"
+bfile_path <- paste0("/scratch/t.phs.yihaolu/GWAS_summary_statistics/GTEx_",chr)
+LD_name <- paste0(LD_path,"v3_LD_",filename,
+                  "_chr",chr,"_r2",r2,"_kb",kb,"_minnum",min_num,
+                  "_numcross",num_cross,".RData")
+if(file.exists(LD_name)) {
+  load(LD_name)
+} else {
+  LD <- pblapply(rsid, function(x) 
+    ieugwasr::ld_matrix(x,bfile = bfile_path,
+                        plink_bin = "plink",pop="EUR",
+                        with_alleles=F),cl = 5)
+  LD <- lapply(LD,function(x) {
+    x[is.na(x)] <- 0
+    return(x)
+  })
+  
+  psd <- sapply(LD,function(x) is.semi.positive.definite(x))
+  LD[!psd] <- lapply(LD[!psd],function(x) as.matrix(Matrix::nearPD(x, corr=T)$mat))
+  
+  lambda <- 0.9
+  LD <- lapply(LD, function(x) lambda * x + (1 - lambda) * diag(1,nrow=nrow(x),ncol=ncol(x)))
+  save(LD, file = LD_name)
+}
+
+## we don't consider LD yet
+# LD <- lapply(gammah, function(x) diag(1,nrow = nrow(x), ncol = nrow(x)))
+L <- length(gammah)
+K1 <- sum(str_detect(colnames(beta_list),"eQTL")); K2 <- sum(str_detect(colnames(beta_list),"mQTL"))
+
+
+##----------------------------------##
+##         Save the data            ##
+##----------------------------------##
+stat = list(L = L, K1 = K1, K2 = K2, Gammah = Gammah, gammah = gammah, pval = pval, se1 = se1, se2 = se2, LD = LD)
+save(stat,
+     file = paste0("/scratch/t.phs.yihaolu/MVMR_ML/result/v3_input_stat_",
+                   filename, "_chr",chr,"_r2",r2,
+                   "_kb",kb,"_minnum",min_num,"_numcross",
+                   num_cross,".RData"))
+
+```
+
+
+```{bash}
+# Set directory paths and filenames
+RDATA_DIR="/scratch/t.phs.yihaolu/MVMR_ML/result"
+SCRIPT_DIR="/scratch/t.phs.yihaolu/map_eQTL/script"
+GWAS_FILE="/scratch/t.phs.yihaolu/GWAS_Meri/v3_disease.csv"
+MAP_EQTL_DIR="/scratch/t.phs.yihaolu/map_eQTL"
+
+# Navigate to the script directory
+cd $SCRIPT_DIR
+
+# Read the disease.csv file, filter out the first row and the "Brain" entries
+while read file; do
+for chr in {1..22}; do
+for r2 in 0.01; do
+for kb in 500; do
+for num_cross in 2; do
+for min_num in 10; do
+# Construct the filename for the RData
+RDATA_FILE="${RDATA_DIR}/v3_input_stat_${file}_chr${chr}_r2${r2}_kb${kb}_minnum${min_num}_numcross${num_cross}.RData"
+
+# Check if the RData file does not exist
+if [ ! -f "$RDATA_FILE" ]; then
+
+# Generate the Slurm job script
+echo '#!/bin/bash
+#SBATCH --mem=30G
+#SBATCH --time=3:00:00
+#SBATCH --ntasks-per-node=5
+#SBATCH --error=v3_prepare_'${chr}'_'${file}'.sh.e%A
+#SBATCH --output=v3_prepare_'${chr}'_'${file}'.sh.o%A
+
+cd '$MAP_EQTL_DIR'
+Rscript v3_prepare.R '${chr}' '${file}' '${r2}' '${num_cross}' '${min_num}' '${kb}' ' > v3_prepare_${chr}_${file}_${r2}_${num_cross}_${min_num}_${kb}.sh
+# Submit the Slurm job script
+sbatch v3_prepare_${chr}_${file}_${r2}_${num_cross}_${min_num}_${kb}.sh
+
+fi
+done
+done
+done
+done
+done
+done < <(awk -F, 'NR > 1 && $1 >= 1 {print $3}' $GWAS_FILE)
+
+
+```
+
+
+
+# Step 6.2 perform MR mint
+```{r}
+# script 1: simplify for clump
+library(data.table)
+library(tidyverse)
+library(pbapply)
+library(MendelianRandomization)
+library(MASS)
+library(glmnet)
+library(quantreg)
+library(robustbase)
+library(MVMR, lib.loc = "/gpfs/data/linchen-lab/Yihao/R/mylib")
+args <- commandArgs(TRUE)
+chr = as.numeric(args[1])
+filename = as.character(args[2])
+r2 = as.numeric(args[3])
+num_cross = as.numeric(args[4])
+min_num = as.numeric(args[5])
+kb = as.numeric(args[6])
+a_init = as.numeric(args[7])
+cc0 = as.numeric(args[8])
+pc0 = as.numeric(args[9])
+print(args)
+print(chr)
+setwd("/scratch/t.phs.yihaolu/MVMR_ML")
+source("experiment_data_generation_test_vec.R")
+source("experiment_data_generation_r1.R")
+print("Load input ...")
+load(paste0("/scratch/t.phs.yihaolu/MVMR_ML/result/v3_input_stat_",
+                   filename, "_chr",chr,"_r2",r2,
+                   "_kb",kb,"_minnum",min_num,"_numcross",
+                   num_cross,".RData"))
+
+# load("/scratch/t.phs.yihaolu/MVMR_ML/result/v3_input_stat_imp_imputed_PGC_ADHD_EUR_2017.txt.gz_chr3_r20.01_kb500_minnum10_numcross2.RData")
+list2env(stat, envir = .GlobalEnv)
+
+print("Source function ...")
+unique_cache <- paste0("/scratch/t.phs.yihaolu/map_eQTL/script/", paste0(args,collapse = "_"))
+if (!dir.exists(unique_cache)) {
+  dir.create(unique_cache, recursive = TRUE)
+}
+source("CCA.R")
+Rcpp::sourceCpp("MRMint_real_data.cpp", cacheDir = unique_cache)
+
+stat$se2 <- lapply(stat$se2, function(x) {
+  x[x<0] <- mean(x[x>0])
+  x
+})
+
+print("Run algorithm ...")
+K1 <- 5; K2 <- 3
+ivw_p <- perform_mvivw(stat, out = "p") %>% data.frame()
+ivw_b <- perform_mvivw(stat, out = "b") %>% data.frame()
+b_beta_init <- mean(var(ivw_b[ivw_p > 0.5],na.rm=T)) * (K1+K2) / 2
+group <- list(1:K1,1:K2+K1)
+set.seed(12)
+#  # finally used
+if(chr <= 5){
+  set.seed(1)
+} else {
+  set.seed(123)
+}
+L <- length(gammah)
+K <- gammah[[1]] %>% ncol()
+opts = list(a_gamma = rep(0,L), b_gamma = rep(0,L),
+            a_alpha = rep(0,L), b_alpha = rep(0,L),
+            a_beta = rep(0,L), b_beta = rep(b_beta_init,L),
+            a = a_init, b = a_init,
+            maxIter = 4000, thin = 10, burnin = 1000)
+
+i = 1:length(gammah)
+times <- system.time({
+  res_CCA_LD <- LDGibbsSampMultOmics(gammah = gammah,
+                                 Gammah = Gammah,
+                                 se1 = se1,
+                                 se2 = se2,
+                                 corr_mat = LD,
+                                 group=group,
+                                 latent_status = gammah[[1]],
+                                 opts = opts,
+                                 low_rank = T,
+                                 display_progress = T,
+                                 CC=cc0,PC1=pc0,PC2=2)
+})
+
+res <- gibbs_output_process(res_CCA_LD)
+res <- lapply(res, function(x) {
+  rownames(x) <- names(gammah)
+  return(x)
+})
+
+res$time <- times[3]
+save(res, file = paste0("/scratch/t.phs.yihaolu/MVMR_ML/result/r1_mintMR_",filename, "_chr",chr,"_r2",r2,"_kb",kb,"_minnum",min_num,"_numcross",num_cross,"_a_init",a_init,"_cc0",cc0,"_pc0",pc0,".RData"))
+
+system(paste0("rm -r ",unique_cache))
+
+```
+
+
+```{bash}
+rm /scratch/t.phs.yihaolu/MVMR_ML/result/r1_mintMR_*
+cd /scratch/t.phs.yihaolu/map_eQTL/script
+while read file; do
+for a_init in 0.1; do
+for cc0 in 3; do
+for pc0 in 2; do
+for r2 in 0.01; do
+for kb in 500; do
+for num_cross in 2; do
+for min_num in 10; do
+if [ "$SLURM_ARRAY_TASK_ID" -gt 5 ]; then
+                  a_init=0.2
+                fi
+RDATA_FILE="/scratch/t.phs.yihaolu/MVMR_ML/result/r1_mintMR_${file}_chr13_r2${r2}_kb${kb}_minnum${min_num}_numcross${num_cross}_a_init${a_init}_cc0${cc0}_pc0${pc0}.RData"
+# if [ ! -f "$RDATA_FILE" ]; then
+echo '#!/bin/bash
+#SBATCH --mem=10G
+#SBATCH --time=6:00:00
+#SBATCH --ntasks-per-node=1
+#SBATCH --partition=tier1q
+#SBATCH --array=1-22%2
+#SBATCH --error=runMR_'${file}'_'${r2}'_'${num_cross}'_'${min_num}'_'${kb}'_a_init'${a_init}'_cc0'${cc0}'_pc0'${pc0}'.sh.e%A_%a
+#SBATCH --output=runMR_'${file}'_'${r2}'_'${num_cross}'_'${min_num}'_'${kb}'_a_init'${a_init}'_cc0'${cc0}'_pc0'${pc0}'.sh.o%A_%a
+
+cd /scratch/t.phs.yihaolu/map_eQTL/
+Rscript r1_runMR.R $SLURM_ARRAY_TASK_ID '${file}' '${r2}' '${num_cross}' '${min_num}' '${kb}' '${a_init}' '${cc0}' '${pc0}'' > runMR_${file}_${r2}_${num_cross}_${min_num}_${kb}_${a_init}_${cc0}_${pc0}.sh
+sbatch runMR_${file}_${r2}_${num_cross}_${min_num}_${kb}_${a_init}_${cc0}_${pc0}.sh
+#fi
+done
+done
+done
+done
+done
+done
+done
+done < <(awk -F, 'NR > 1 && $1 >= 1 {print $3}' /scratch/t.phs.yihaolu/GWAS_Meri/v3_disease.csv)
+```
+
+
+
+load mintMR result
+```{r}
+library(data.table)
+library(tidyverse)
+library(pbapply)
+trait_list <- read_csv("/scratch/t.phs.yihaolu/GWAS_Meri/v3_disease.csv")$Filename
+dict <- read_csv("/scratch/t.phs.yihaolu/GWAS_Meri/v3_disease.csv")
+setwd("/scratch/t.phs.yihaolu/MVMR_ML/result")
+genomic_inflation_factor <- function(p){
+  p <- na.omit(p)
+  z = qnorm(p/2)
+  lambda = median(z^2) / 0.454
+  return(lambda)
+}
+
+r2 <- 0.01
+kb <- 500
+min_num <- 10
+num_cross <- 2
+a_init <- 0.1
+# cc0 <- 3
+cc0 <- 2
+pc0 <- 2
+
+for (a_init in c(0.1)) {
+  for (cc0 in c(3)) {
+    for (pc0 in c(2)) {
+      print(paste0(a_init," - ", cc0," - ", pc0))
+      mean_GIF <- df <- df_beta <- list()
+      for (method in c("time")) {
+        pval_count <- list(); cnt = 1
+        for (trait in trait_list) {
+          for (chr in 1:22) {
+            filename <- paste0("/scratch/t.phs.yihaolu/MVMR_ML/result/r1_mintMR_",
+                         trait, "_chr",chr,"_r2",r2,
+                         "_kb",kb,"_minnum",min_num,"_numcross",
+                         num_cross,"_a_init",
+                         a_init,"_cc0",cc0,"_pc0",pc0,".RData")
+            if(file.exists(filename)){
+              load(filename)
+              pval = res[[method]]
+              names(pval) <- trait
+              pval_count[[cnt]] <- pval
+              cnt = cnt + 1
+            }
+          }
+        }
+        pval_count <- unlist(pval_count)
+        df[[method]] <- data.frame(Filename = names(pval_count),Time = pval_count) %>% group_by(Filename) %>% summarise(time = sum(Time))
+        
+      }
+    }
+  }
+}
+
+df <- df$time %>% inner_join(dict, by = "Filename")
+df <- df %>% filter(Keep == 2)
+mean(df$time)
+max(df$time)
+min(df$time)
+
+# > mean(df$time)
+# [1] 7083.297
+# > max(df$time)
+# [1] 9076.168
+# > min(df$time)
+# [1] 6521.057
+```
+
+# Step 7. counts
+```{r}
+library(data.table)
+library(tidyverse)
+library(pbapply)
+library(qvalue)
+source("~/Downloads/Research/MVMR_ML/scripts/process_TWAS.R")
+source("~/Downloads/Research/MVMR_ML/scripts/simulation_data_gen_fix_effectsize.R")
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+dict <- read_csv("v3_disease.csv") %>% filter(Keep > 0)
+
+load("p.combined.RData")
+df <- df$pval_mint %>% relocate(gene_id, .after = where(is.numeric))
+
+p_thres <- 1e-3 # ~FDR=0.05
+
+total_number_gene <- df %>% 
+  group_by(trait) %>% 
+  summarise(total_gene = n_distinct(gene_id))
+df$sign <- rowSums(df %>% select(X1:X3,X5:X6) < p_thres,na.rm=T)
+sign_number_gene <- df %>% 
+  filter(sign >= 2) %>% 
+  group_by(trait) %>% 
+  summarise(sign_gene = n_distinct(gene_id))
+df$sign_DNAm <- rowSums(df %>% select(X4,X7:X8) < p_thres,na.rm=T)
+sign_number_CpG <- df %>% 
+  filter(sign_DNAm >= 2) %>% 
+  group_by(trait) %>% 
+  summarise(sign_DNAm = n_distinct(gene_id))
+
+
+total_number_gene %>% 
+  inner_join(sign_number_gene,by="trait") %>% 
+  inner_join(sign_number_CpG,by="trait") %>% 
+  inner_join(dict %>% select(Filename,Keep,Category,Trait), by = c("trait" = "Filename")) %>% 
+  filter(Keep>0) %>%
+  select(-Keep,-trait) %>% 
+  relocate(Category,Trait) %>% 
+  arrange(desc(sign_gene)) %>% 
+  write_csv("v3_total_num.csv")
+
+
+df <- df %>% 
+  inner_join(dict, by = c("trait" = "Filename")) %>% 
+  full_join(TWAS,by = c("Trait" = "trait", "gene_id" = "ID"))
+```
+
+```{r}
+####################################################################################
+######################################## TWAS replication ##########################
+####################################################################################
+d <- TWAS %>% filter(MODEL %in% c("lasso"))
+max(d$TWAS.P[qvalue(d$TWAS.P)$qvalue<0.05]) # 0.001925
+
+mintMR_threshold <- 1e-3 # ~FDR=0.05
+TWAS_threshold <- 0.005
+# TWAS_threshold <- 1e-4
+TWAS_sign_count <- df %>% 
+  group_by(MODEL, Trait) %>% 
+  filter(TWAS.P < TWAS_threshold) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+TWAS_all_count <- df %>% 
+  group_by(MODEL, Trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+TWAS_sign_prop <- TWAS_sign_count %>% 
+  full_join(TWAS_all_count,by = c("MODEL","Trait")) %>% 
+  mutate(prop = count_of_gene.x / count_of_gene.y)
+
+
+MINT_sign_count <- df[which(rowSums(df[,c(1:3,5:6)] < mintMR_threshold) >= 2),] %>% 
+  filter(TWAS.P < TWAS_threshold) %>% 
+  group_by(MODEL, Trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+MINT_all_count <- 
+  df[which(rowSums(df[,c(1:3,5:6)] < mintMR_threshold) >= 2),] %>%
+  group_by(MODEL, Trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+MINT_sign_prop <- MINT_sign_count %>% 
+  full_join(MINT_all_count,by = c("MODEL","Trait")) %>% 
+  mutate(prop = count_of_gene.x / count_of_gene.y)
+
+TWAS_sign_prop %>% 
+  inner_join(MINT_sign_prop, by = c("MODEL","Trait")) %>% 
+  filter(MODEL == "lasso") %>%
+  View()
+
+TWAS_gene <- df[which(rowSums(df[,c(1:3,5:6)] < mintMR_threshold) >= 2),] %>% 
+  filter(TWAS.P < TWAS_threshold) %>% 
+  filter(Trait == "Schizophrenia", MODEL == "enet") %>% 
+  filter(TWAS.P < TWAS_threshold) %>% 
+  select(gene_id, TWAS.P, COLOC.PP4)
+
+TWAS_gene_background <- df[which(rowSums(df[,c(1:3,5:6)] < mintMR_threshold) >= 2),] %>% 
+  filter(Trait == "Schizophrenia", MODEL == "enet") %>% 
+  select(gene_id, TWAS.P, COLOC.PP4)
+
+
+TWAS_gene %>% 
+  drop_na() %>% 
+  group_by(gene_id) %>% 
+  slice_max(COLOC.PP4,n=1)
+
+####################################################################################
+######################################## Coloc replication #########################
+####################################################################################
+TWAS_threshold <- 0.7
+
+TWAS_sign_count <- df %>% 
+  group_by(MODEL, Trait) %>% 
+  filter(COLOC.PP4 > TWAS_threshold) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+TWAS_all_count <- df %>% 
+  group_by(MODEL, Trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+TWAS_sign_prop <- TWAS_sign_count %>% 
+  full_join(TWAS_all_count,by = c("MODEL","Trait")) %>% 
+  mutate(prop = count_of_gene.x / count_of_gene.y)
+
+
+MINT_sign_count <- df[which(rowSums(df[,c(1:3,5:6)] < 1e-3) >= 2),] %>% 
+  filter(COLOC.PP4 > TWAS_threshold) %>% 
+  group_by(MODEL, Trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+MINT_all_count <- df[which(rowSums(df[,c(1:3,5:6)] < 1e-3) >= 2),] %>% 
+  group_by(MODEL, Trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+MINT_sign_prop <- MINT_sign_count %>% 
+  full_join(MINT_all_count,by = c("MODEL","Trait")) %>% 
+  mutate(prop = count_of_gene.x / count_of_gene.y)
+
+TWAS_sign_prop %>% 
+  inner_join(MINT_sign_prop, by = c("MODEL","Trait")) %>% 
+  View()
+
+
+####################################################################################
+######################################## SMR replication ###########################
+####################################################################################
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+dict <- read_csv("disease.csv")
+df <- fread("LD_mint_result_prelim.txt")
+df <- fread("v3_mintMR_external_data_cc3.txt")
+df <- fread("v3_mintMR_external_data.txt")
+
+
+# df <- fread("v3_mintMR_external_data_0.2.txt")
+
+SMR <- read_csv("SMR.robin.csv") %>% 
+  select(Gene, p_SMR) %>% mutate(p_SMR = as.numeric(p_SMR))
+SMR_thres <- 6.45e-3 # 6.45e-3 # 1e-4
+# SMR_thres <- 1e-4
+df_sign <- df[which(rowSums(df[,c(1:3,5:6)] < 1e-3) >= 2),] %>% 
+  inner_join(SMR, by = c("gene_id" = "Gene")) %>% 
+  group_by(trait) %>% 
+  filter(p_SMR < SMR_thres) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+df_all <- df[which(rowSums(df[,c(1:3,5:6)] < 1e-3) >= 2),] %>% 
+  inner_join(SMR, by = c("gene_id" = "Gene")) %>% 
+  group_by(trait) %>% 
+  summarise(count_of_gene = n_distinct(gene_id))
+
+df_sign %>% 
+  inner_join(df_all, by = c("trait")) %>% 
+  mutate(prop = count_of_gene.x/count_of_gene.y) %>% 
+  mutate(diff = prop/mean(SMR$p_SMR<SMR_thres,na.rm=T)) %>% 
+  arrange(desc(diff)) %>% 
+  filter(trait == "imp_imputed_pgc.scz2.txt.gz")
+
+
+SMR_gene <- df[which(rowSums(df[,c(1:3,5:6)] < 1e-3) >= 2),] %>% 
+  inner_join(SMR, by = c("gene_id" = "Gene")) %>% 
+   filter(p_SMR<SMR_thres, trait == "imp_imputed_pgc.scz2.txt.gz")
+SMR_gene_background <- df[which(rowSums(df[,c(1:3,5:6)] < 1e-3) >= 2),] %>% 
+  inner_join(SMR, by = c("gene_id" = "Gene")) %>% 
+  filter(trait == "imp_imputed_pgc.scz2.txt.gz")
+
+base::union(unique(TWAS_gene$gene_id),SMR_gene$gene_id)
+base::union(unique(TWAS_gene_background$gene_id),SMR_gene_background$gene_id)
+```
+
+# Step 8. GIF
+```{r}
+library(data.table)
+library(tidyverse)
+library(pbapply)
+
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+dict <- read_csv("v3_disease.csv") %>% filter(Keep > 0)
+disease <- dict$Trait; names(disease) <- dict$Filename
+category <- dict$Category; names(category) <- dict$Filename
+
+genomic_inflation_factor <- function(p){
+  p <- na.omit(p)
+  z = qnorm(p/2)
+  lambda = median(z^2) / 0.454
+  return(lambda)
+}
+
+load("p.combined.RData")
+mean_GIF <- list()
+for (method in names(df)) {
+  GIF <- df[[method]] %>% 
+    split(df[[method]]$trait) %>% 
+    lapply(function(x) apply(x %>% 
+                               select(contains("X")),2,
+                             genomic_inflation_factor)) %>% 
+            do.call("rbind",.)
+  if(ncol(GIF) == 8) {
+    mean_GIF[[method]] <- rowMeans(GIF[,c(1:3,5:6)]) %>% data.frame(x=.)
+  } else {
+    mean_GIF[[method]] <- rowMeans(GIF) %>% data.frame(x=.)
+  }
+  colnames(mean_GIF[[method]]) <- method
+  mean_GIF[[method]] <- mean_GIF[[method]] %>% rownames_to_column(var = "trait")
+}
+mean_GIF %>% 
+  Reduce(function(x,y) inner_join(x,y,by="trait"),.) %>% 
+  inner_join(dict, by = c("trait" = "Filename")) %>% 
+  select(Category, Trait, pval_mint:pval_mint_single) %>% 
+  group_by(Category) %>% 
+  mutate(n = n()) %>% 
+  arrange(desc(n), pval_mint) %>% 
+  select(-n) %>% 
+  write.csv("GIF_v3_mint_and_single.csv")
+  
+
+
+mean_GIF <- mean_GIF %>% 
+  Reduce(function(x,y) inner_join(x,y,by="trait"),.) %>% 
+  inner_join(dict, by = c("trait" = "Filename")) %>% 
+  select(Category, Trait, ivw:uv_exp_median) %>% 
+  arrange(Category) %>% 
+  filter(!str_detect(Trait, "male")) %>% 
+  select(Category:Trait, pval_mint, ivw, median:uv_exp_median) %>%
+  arrange(Category) %>% 
+  select(Trait:egger) %>% 
+  column_to_rownames(var = "Trait")
+
+diff <- sweep(mean_GIF,1,STATS = mean_GIF$pval_mint,FUN = "-")
+
+mean_GIF <- apply(mean_GIF,2,function(x) sprintf("%.2f", round(x, 2))) %>% data.frame()
+rownames(mean_GIF) <- rownames(diff)
+
+mean_GIF[diff > 0] <- 
+  paste0("{\\ul",mean_GIF[diff > 0],"}")
+
+mean_GIF[order(-rowSums(diff > 0),mean_GIF$pval_mint),c(1,3,5,2,4,6)] %>% 
+  write.csv("GIF_v3.csv")
+```
+
+# Step 8. Pathway enrichment for genes
+```{r}
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(KEGGREST)
+library(DOSE)
+library(data.table)
+library(tidyverse)
+library(pbapply)
+library(seriation)
+library(pheatmap)
+library(Pigengene)
+conflicted::conflicts_prefer(dplyr::select)
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::rename)
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+source("~/Downloads/Research/MVMR_ML/scripts/functions.R")
+dict <- read_csv("v3_disease.csv") %>% filter(Keep > 0)
+# df <- fread("v3_mintMR_external_data.txt")
+
+load("p.combined.RData")
+df <- df$pval_mint %>% relocate(gene_id, .after = where(is.numeric))
+
+df <- df %>% 
+  inner_join(dict, by = c("trait" = "Filename"))
+genes <- df %>%
+  split(.$trait) %>%
+  lapply(function(x) x[rowSums(x[,c(1:3,5:6)]<1e-3) >= 2,]$gene_id)
+# genes <- df %>%
+#   filter(Category == "Immunological") %>% 
+#   split(.$trait) %>%
+#   lapply(function(x) x[rowSums(x[,c(4,7:8)]<1e-3) >= 2,]$gene_id)
+
+genes_entrez <- lapply(genes, 
+                       function(x) bitr(x, fromType="SYMBOL", toType=c("ENTREZID"), OrgDb="org.Hs.eg.db"))
+
+# Enrichment Analysis for KEGG:
+kegg <- lapply(seq_along(genes_entrez), function(x) {
+  kegg_enrich <- enrichKEGG(gene         = genes_entrez[[x]]$ENTREZID,
+                            organism     = 'hsa',
+                            pvalueCutoff = 1,
+                            qvalueCutoff = 1)
+  data.frame(kegg_enrich) %>% select(Description, pvalue)
+}) %>%
+  Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+colnames(kegg)[2:ncol(kegg)] <- names(genes_entrez)
+plot_enrichment(kegg, filename = "kegg_enrich.pdf", width=10, height = 9,
+                visual_threshold = 1e-2, visual_count = 1)
+
+
+DO <- lapply(genes_entrez, function(x) {
+  DO_enrich <- enrichDO(gene = x$ENTREZID,
+                        pvalueCutoff = 1,
+                        qvalueCutoff = 1)
+  data.frame(DO_enrich) %>% select(Description, pvalue)
+}) %>%
+  Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+colnames(DO)[2:ncol(DO)] <- names(genes_entrez)
+plot_enrichment(DO, filename = "DO_enrich.pdf", width=13, height = 10)
+
+
+
+# # GO - 1
+# ont <- c("CC","BP","MF")
+# lv <- c(1,2,3,4)
+# result <- list()
+# for (ot in ont) {
+#   print(ot)
+#   result[[ot]] <- list()
+#   GO <- pblapply(genes, function(x) {
+#     GO_enrich <- enrichGO(
+#       gene = x,
+#       OrgDb = 'org.Hs.eg.db',
+#       ont = ot,
+#       keyType = 'SYMBOL',
+#       pvalueCutoff = 1,
+#       qvalueCutoff = 1)
+#     GO_enrich
+# 
+#   },cl=3)
+#   for (l in lv) {
+#     print(l)
+#     df <- lapply(GO, gofilter, level = l) %>%
+#       lapply(function(x) data.frame(x) %>% select(Description, pvalue)) %>%
+#       Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+#     colnames(df)[2:ncol(df)] <- names(genes)
+#     result[[ot]][[l]] <- df
+#   }
+# }
+# save(result, file = "GO_stratified.RData")
+
+load("GO_stratified.RData")
+df <- lapply(result, function(x) x[[4]]) %>% 
+  rbindlist() 
+df <- df %>% select(Description,names(genes))
+
+plot_enrichment(df, filename = "GO_enrich2.pdf",
+                visual_threshold = 5e-3,
+                visual_count = 2,
+                width = 10, height = 12)
+
+
+# # GO - 2
+# GO <- pblapply(genes, function(x) {
+#   GO_enrich <- enrichGO(
+#     gene = x,
+#     OrgDb = 'org.Hs.eg.db',
+#     ont = "ALL",
+#     keyType = 'SYMBOL',
+#     pvalueCutoff = 1,
+#     qvalueCutoff = 1)
+#   data.frame(GO_enrich) %>% select(Description, pvalue)
+# },cl=5) %>%
+#   Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+# colnames(GO)[2:ncol(GO)] <- names(genes)
+# save(GO, file = "GO.RData")
+
+load("GO.RData")
+GO <- GO %>% select(Description,names(genes))
+GO <- GO %>% filter(!str_detect(Description,"oxidoreductase"))
+plot_enrichment(GO, filename = "GO_enrich.pdf",
+                width = 11, height = 10, visual_threshold = 1e-3,
+                visual_count = 1)
+
+# top <- fread("/Users/yihaolu/Downloads/Other/Complex_2_Pathway_human.txt")
+# react <- pblapply(seq_along(genes_entrez), function(x) {
+#   kegg_enrich <- enrichPathway(gene = genes_entrez[[x]]$ENTREZID,
+#                                organism = "human",
+#                                pvalueCutoff = 1,
+#                                qvalueCutoff = 1)
+#   res <- data.frame(kegg_enrich) %>% select(ID,Description, pvalue)
+#   return(res)
+# },cl=5) %>%
+#   Reduce(function(x,y) full_join(x, y, by = c("ID","Description")), .)
+# colnames(react)[3:ncol(react)] <- names(genes_entrez)
+# save(react, file = "react.RData")
+
+load("react.RData")
+react <- react %>% data.table() %>% select(-ID)
+react <- rbindlist(list(df,react),fill=T)
+react$Description[react$Description == "oxidoreductase activity, acting on paired donors, with incorporation or reduction of molecular oxygen"] <- "oxidoreductase activity, acting on paired donors"
+plot_enrichment(react,
+                filename = "react_enrich.pdf", width = 11,
+                height = 12,
+                visual_threshold = 5e-3,
+                visual_count = 2)
+```
+# Step 9. Pathway enrichment for CpGs
+```{r}
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(KEGGREST)
+library(DOSE)
+library(data.table)
+library(tidyverse)
+library(pbapply)
+library(seriation)
+library(pheatmap)
+library(Pigengene)
+conflicted::conflicts_prefer(dplyr::select)
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::rename)
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+source("~/Downloads/Research/MVMR_ML/scripts/functions.R")
+dict <- read_csv("v3_disease.csv") %>% filter(Keep > 0)
+# df <- fread("v3_mintMR_external_data.txt")
+load("p.combined.RData")
+df <- df$pval_mint %>% relocate(gene_id, .after = where(is.numeric))
+
+df <- df %>% 
+  inner_join(dict, by = c("trait" = "Filename"))
+genes <- df %>%
+  # filter(Category == "Immunological") %>%
+  split(.$trait) %>%
+  lapply(function(x) x[rowSums(x[,c(4,7:8)]<1e-3) >= 2,]$gene_id)
+
+genes_entrez <- lapply(genes, 
+                       function(x) bitr(x, fromType="SYMBOL", toType=c("ENTREZID"), OrgDb="org.Hs.eg.db"))
+
+# # Enrichment Analysis for KEGG:
+# kegg <- lapply(seq_along(genes_entrez), function(x) {
+#   kegg_enrich <- enrichKEGG(gene         = genes_entrez[[x]]$ENTREZID,
+#                             organism     = 'hsa',
+#                             pvalueCutoff = 1,
+#                             qvalueCutoff = 1)
+#   data.frame(kegg_enrich) %>% select(Description, pvalue)
+# }) %>%
+#   Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+# colnames(kegg)[2:ncol(kegg)] <- names(genes_entrez)
+# plot_enrichment(kegg, filename = "cpg_kegg_enrich.pdf", width=10, height = 9,
+#                 visual_threshold = 1e-2, visual_count = 1)
+# 
+# 
+# DO <- lapply(genes_entrez, function(x) {
+#   DO_enrich <- enrichDO(gene = x$ENTREZID,
+#                         pvalueCutoff = 1,
+#                         qvalueCutoff = 1)
+#   data.frame(DO_enrich) %>% select(Description, pvalue)
+# }) %>%
+#   Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+# colnames(DO)[2:ncol(DO)] <- names(genes_entrez)
+# plot_enrichment(DO, filename = "cpg_DO_enrich.pdf", width=13, height = 10)
+
+
+
+# # GO - 1
+# ont <- c("CC","BP","MF")
+# lv <- c(1,2,3,4)
+# result <- list()
+# for (ot in ont) {
+#   print(ot)
+#   result[[ot]] <- list()
+#   GO <- pblapply(genes, function(x) {
+#     GO_enrich <- enrichGO(
+#       gene = x,
+#       OrgDb = 'org.Hs.eg.db',
+#       ont = ot,
+#       keyType = 'SYMBOL',
+#       pvalueCutoff = 1,
+#       qvalueCutoff = 1)
+#     GO_enrich
+# 
+#   },cl=3)
+#   for (l in lv) {
+#     print(l)
+#     df <- lapply(GO, gofilter, level = l) %>%
+#       lapply(function(x) data.frame(x) %>% select(Description, pvalue)) %>%
+#       Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+#     colnames(df)[2:ncol(df)] <- names(genes)
+#     result[[ot]][[l]] <- df
+#   }
+# }
+# save(result, file = "cpg_GO_stratified.RData")
+
+load("cpg_GO_stratified.RData")
+df <- lapply(result, function(x) x[[4]]) %>% 
+  rbindlist() 
+df <- df %>% select(Description,names(genes))
+
+plot_enrichment(df, filename = "cpg_GO_enrich2.pdf",
+                visual_threshold = 1e-2,
+                visual_count = 1,
+                width = 15, height = 12)
+
+
+# # GO - 2
+# GO <- pblapply(genes, function(x) {
+#   GO_enrich <- enrichGO(
+#     gene = x,
+#     OrgDb = 'org.Hs.eg.db',
+#     ont = "ALL",
+#     keyType = 'SYMBOL',
+#     pvalueCutoff = 1,
+#     qvalueCutoff = 1)
+#   data.frame(GO_enrich) %>% select(Description, pvalue)
+# },cl=5) %>%
+#   Reduce(function(x,y) full_join(x, y, by = "Description"), .)
+# colnames(GO)[2:ncol(GO)] <- names(genes)
+# save(GO, file = "cpg_GO.RData")
+# 
+# load("cpg_GO.RData")
+# GO <- GO %>% select(Description,names(genes))
+# GO <- GO %>% filter(!str_detect(Description,"oxidoreductase"))
+# plot_enrichment(GO, filename = "cpg_GO_enrich.pdf",
+#                 width = 11, height = 7, visual_threshold = 1e-3,
+#                 visual_count = 2)
+
+# top <- fread("/Users/yihaolu/Downloads/Other/Complex_2_Pathway_human.txt")
+# react <- pblapply(seq_along(genes_entrez), function(x) {
+#   kegg_enrich <- enrichPathway(gene = genes_entrez[[x]]$ENTREZID,
+#                                organism = "human",
+#                                pvalueCutoff = 1,
+#                                qvalueCutoff = 1)
+#   res <- data.frame(kegg_enrich) %>% select(ID,Description, pvalue)
+#   return(res)
+# },cl=5) %>%
+#   Reduce(function(x,y) full_join(x, y, by = c("ID","Description")), .)
+# colnames(react)[3:ncol(react)] <- names(genes_entrez)
+# save(react, file = "cpg_react.RData")
+
+load("cpg_react.RData")
+react <- react %>% data.table() %>% select(-ID)
+react <- rbindlist(list(df,react),fill=T)
+react$Description[react$Description=="immune response-regulating cell surface receptor signaling pathway involved in phagocytosis"] <- "immune response-regulating cell surface receptor signaling pathway (phagocytosis)"
+plot_enrichment(react,
+                filename = "cpg_react_enrich.pdf", width = 5.6,
+                height = 12,
+                visual_threshold = 5e-3,
+                visual_count = 2)
+```
+
+
+
+
+
+
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+source("../scripts/simulation_data_gen_fix_effectsize.R")
+load("p.combined.RData")
+
+gif <- read.csv("GIF.v2.all.compete.0.232.csv")
+
+rename_func <- function(df) {
+  if("X8" %in% colnames(df)) {
+    colnames(df)[which(str_starts(colnames(df), "X"))] <- 
+      c("Muscle Skeletal","Lung","Brain Cerebellum", "Lung (DNAm)","ROSMAP", "eQTLGen","FUSION (DNAm)","LBC (DNAm)")
+  } else if("X5" %in% colnames(df)) {
+    colnames(df)[which(str_starts(colnames(df), "X"))] <- 
+      c("Muscle Skeletal","Lung","Brain Cerebellum","ROSMAP", "eQTLGen")
+  } else {
+    if(length(which(str_starts(colnames(df), "bx"))) == 5){
+      colnames(df)[which(str_starts(colnames(df), "bx"))] <- 
+      c("Muscle Skeletal","Lung","Brain Cerebellum","ROSMAP", "eQTLGen")
+    } else {
+      colnames(df)[which(str_starts(colnames(df), "bx"))] <- 
+      c("Muscle Skeletal","Lung","Brain Cerebellum", "Lung (DNAm)","ROSMAP", "eQTLGen","FUSION (DNAm)","LBC (DNAm)")
+    }
+  }
+  df
+}
+
+t <- "imp_imputed_UKB_20002_1065_self_reported_hypertension.txt.gz"
+
+df_tmp <- df %>% 
+  lapply(function(x) x %>% 
+           filter(trait == t) %>% 
+           rename_func())
+p <- df_tmp %>% 
+  lapply(function(x) x %>%
+           select(all_of(tissue_list)) %>%
+           melt() %>%
+           select(-variable)) %>%
+  do.call("cbind",.) %>% data.frame()
+print(apply(p,2,median,na.rm=T))
+colnames(p) <- c("mvivw","mvmint","mint_single","mvmedian","mvrobust","mvlasso","mvegger","ivw","egger","lasso","robust","median","uv_exp_ivw","uv_exp_egger","uv_exp_robust","uv_exp_median")
+apply(p,2,genomic_inflation_factor)
+fig <- p %>% 
+  select(mvmint,mint_single) %>% 
+  drop_na() %>% 
+  gg_qqplot_mv_uv()+
+  coord_cartesian(xlim = c(0,3.5))+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+ggsave(paste0(t,".pdf"), plot = fig, 
+       width = 5.5, height = 2.8)
+
+
+```
+
+
+```{r}library(data.table)
+library(tidyverse)
+library(ggplot2)
+setwd("/Users/yihaolu/Downloads/Research/MVMR_ML/data/")
+source("../scripts/geom_effect.R")
+source("../scripts/geom_stripes.R")
+load("b.combined.RData")
+load("p.combined.RData")
+
+t <- "imp_imputed_UKB_20002_1065_self_reported_hypertension.txt.gz"
+df$pval_mint <- df$pval_mint %>% filter(trait == t)
+df$pval_mint_single <- df$pval_mint_single %>% filter(trait == t)
+df_beta$beta_mint <- df_beta$beta_mint %>% filter(trait == t)
+df_beta$beta_mint_single <- df_beta$beta_mint_single %>% filter(trait == t)
+df$ivw <- df$ivw %>% filter(trait == t)
+
+df$pval_mint %>% filter(gene_id == "HSPA4")
+
+gene_set <- c("HSPA4",#"SPATA24","RAD50","FAM53C",
+              "HARS2","KIAA0141","ARHGEF37")# ,"SNX24"
+
+df <- df %>% 
+  lapply(function(x) x %>% filter(trait == t, gene_id %in% gene_set))
+df_beta <- df_beta %>% 
+  lapply(function(x) x %>% filter(trait == t, gene_id %in% gene_set))
+  
+pval_mint_single <- df$pval_mint_single %>% 
+  select(gene_id, X5) %>% 
+  rename(p_mint = X5)
+pval_mint <- df$pval_mint %>% 
+  select(gene_id, X6) %>% 
+  rename(p_mint = X6)
+
+beta_mint_single <- df_beta$beta_mint_single %>% 
+  select(gene_id, X5) %>% 
+  rename(b_mint = X5)
+beta_mint <- df_beta$beta_mint %>% 
+  select(gene_id, X6) %>% 
+  rename(b_mint = X6)
+
+df_mint_single <- pval_mint_single %>% 
+  inner_join(beta_mint_single, by = "gene_id") %>% 
+  mutate(se_mint = 
+           abs(b_mint/qnorm(p_mint/2))) %>% 
+  mutate(cil = b_mint - 1.96 * se_mint,
+         ciu = b_mint + 1.96 * se_mint) %>% 
+  mutate(type = "exp1_only") %>% 
+  select(gene_id, type, cil, ciu)
+df_mint <- pval_mint %>% 
+  inner_join(beta_mint, by = "gene_id") %>% 
+  mutate(se_mint = abs(b_mint/qnorm(p_mint/2))) %>% 
+  mutate(cil = b_mint - 1.96 * se_mint,
+         ciu = b_mint + 1.96 * se_mint) %>% 
+  mutate(type = "exp2_dnam") %>% 
+  select(gene_id, type, cil, ciu)
+
+result <- rbind(df_mint,df_mint_single)
+result <- result %>% mutate(beta = (cil + ciu) / 2)
+result$gene_id <- factor(result$gene_id,levels = rev(gene_set))
+
+fig <- ggplot(data = result,
+       aes(x = beta, y = gene_id)) +
+    geom_effect(
+        ggplot2::aes(
+            xmin = cil,
+            xmax = ciu,
+            color = type
+        ),position = ggstance::position_dodgev(height = 0.5)) +
+    geom_stripes(odd = "#33333333", even = "#00000000") +
+    geom_vline(xintercept = 0, linetype=2) +
+    xlab("Causal effect\n(95% Confidence Interval)") +
+    ylab(NULL)+
+    theme(axis.text.x = element_text(angle = 45, size=14, hjust=1))+
+    theme(legend.position=c(0.80,0.095),legend.text = element_text(family="mono",size=12), legend.box.background = element_rect(colour = "black",size=0.8),legend.title=element_blank())+
+    scale_color_manual(values = c("blue","red"),
+                       labels = c("mintMR (exp only)","mintMR (exp+DNAm)"))+
+    theme(strip.background = element_rect(fill='white',color='white'),strip.text = element_text(size = 12, face = "plain")) +
+    theme(plot.tag = element_text(face='bold'))+theme(strip.text.y = element_text(angle = 0)) +
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank())+
+  theme(axis.text.y = element_text(face = "italic"))+
+  labs(col = "")+
+  scale_x_continuous(limits = c(-0.045,0.065))
+ggsave(paste0("causal_effects.pdf"), plot = fig, 
+         width = 5.5, height = 2.8)
+```
